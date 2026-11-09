@@ -23,6 +23,9 @@ COMPETITIONS = ("PD", "PL", "FL1", "CL")
 TSD_LEAGUES = {"PD": "4335", "PL": "4328", "FL1": "4334", "CL": "4480"}
 OLG_LEAGUES = {"PD": "la1", "PL": "pl", "CL": "ucl"}
 COMP_NAMES_FR = {"PD": "La Liga", "PL": "Premier League", "FL1": "Ligue 1", "CL": "Ligue des champions UEFA"}
+# dateTo is exclusive in football-data.org. These disjoint windows include
+# seven days of recent results, today, and every date through day +30.
+MATCH_WINDOWS = ((-7, 3), (3, 13), (13, 23), (23, 31))
 
 
 def get_json(url: str, headers: dict[str, str] | None = None):
@@ -88,6 +91,7 @@ def tsd_event(raw, code):
         "idEvent": f"tsd-{raw.get('idEvent')}", "source": "TheSportsDB",
         "feedKind": "public-aggregated",
         "competitionCode": code, "strLeague": COMP_NAMES_FR[code],
+        "strCompetitionBadge": raw.get("strLeagueBadge") or raw.get("strLeagueLogo") or "",
         "strSeason": raw.get("strSeason") or "", "strHomeTeam": home, "strAwayTeam": away,
         "idHomeTeam": f"tsd-team-{raw.get('idHomeTeam') or ''}",
         "idAwayTeam": f"tsd-team-{raw.get('idAwayTeam') or ''}",
@@ -119,6 +123,7 @@ def fd_event(item):
     return {
         "idEvent": f"fd-{item['id']}", "source": "football-data.org", "feedKind": "public-aggregated", "competitionCode": comp.get("code", ""),
         "strLeague": COMP_NAMES_FR.get(comp.get("code"), comp.get("name", "")),
+        "strCompetitionBadge": comp.get("emblem") or "",
         "strSeason": str((item.get("season") or {}).get("startDate", ""))[:4],
         "strHomeTeam": home["name"], "strAwayTeam": away["name"],
         "idHomeTeam": f"fd-team-{home.get('id', '')}", "idAwayTeam": f"fd-team-{away.get('id', '')}",
@@ -194,12 +199,13 @@ def football(token: str = "", now: dt.datetime | None = None):
             }
         source_status[code] = {"thesportsdb": {"next": len(next_events), "previous": len(previous), "tableRows": len(table)}}
 
-    # Full fixtures and standings, within football-data.org's 10 calls/min free limit.
+    # Four fixture windows plus four tables use eight calls, under the free
+    # tier's ten calls/minute limit. dateTo is exclusive.
     fd_events, fd_comp_available, fd_table_available = [], set(), set()
     failures = []
     if token:
         try:
-            for index, (start, end) in enumerate(((-5, 4), (4, 7))):
+            for index, (start, end) in enumerate(MATCH_WINDOWS):
                 if index: time.sleep(1.1)
                 query = urllib.parse.urlencode({
                     "competitions": ",".join(COMPETITIONS),
@@ -252,7 +258,7 @@ def football(token: str = "", now: dt.datetime | None = None):
                     event = olg_event(raw, code)
                     if event:
                         kickoff = dt.datetime.fromisoformat(event["strTimestamp"].replace("Z", "+00:00"))
-                        if now - dt.timedelta(days=5) <= kickoff <= now + dt.timedelta(days=7):
+                        if now - dt.timedelta(days=7) <= kickoff <= now + dt.timedelta(days=30, hours=23, minutes=59, seconds=59):
                             olg_events.append(event)
             if code not in fd_table_available and (code not in tables or not tables[code].get("complete")):
                 rows = olg_table(get_json(f"{OLG_API}/getbltable/{shortcut}/{season}"))
@@ -294,11 +300,16 @@ def football(token: str = "", now: dt.datetime | None = None):
         source_status[code]["coverage"] = "complete" if match_coverage == table_coverage == "complete" else "partial"
     matches = sorted(matches_by_key.values(), key=lambda x: (x["strTimestamp"], x["competitionCode"], x["idEvent"]))
     source_data_times = [e.get("sourceUpdatedAt") for e in matches if e.get("sourceUpdatedAt")]
+    competition_badges = {e["competitionCode"]: e["strCompetitionBadge"] for e in matches
+                          if e.get("competitionCode") and e.get("strCompetitionBadge")}
     return {
         "schema": 1, "source": "multi-source", "scoresDelayed": True,
         "updatedAt": checked, "checkedAt": checked,
         "sourceDataUpdatedAt": max(source_data_times) if source_data_times else None,
         "timezone": "Europe/Paris", "competitions": list(COMPETITIONS),
+        "fixtureRange": {"from": (now.date() - dt.timedelta(days=7)).isoformat(),
+                         "through": (now.date() + dt.timedelta(days=31)).isoformat()},
+        "competitionBadges": competition_badges,
         "sources": ["TheSportsDB", "football-data.org", "OpenLigaDB"],
         "attribution": {"TheSportsDB": "Sports data: TheSportsDB",
                         "football-data.org": "Football data provided by the Football-Data.org API",
