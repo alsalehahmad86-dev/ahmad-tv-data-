@@ -58,16 +58,18 @@ def iso_utc(value):
 def team_key(value):
     import unicodedata
     value = unicodedata.normalize("NFKD", str(value or "").casefold())
+    value = value.replace("ø", "o")
     value = "".join(c for c in value if not unicodedata.combining(c))
     value = " ".join(value.replace("&", " and ").replace(".", " ").split())
-    for suffix in (" football club", " fc", " cf", " sc", " club"):
+    for suffix in (" football club", " fc", " cf", " sc", " ac", " club"):
         if value.endswith(suffix):
             value = value[:-len(suffix)].strip()
-    value = value.removeprefix("fc ").removeprefix("cf ").removeprefix("sc ")
+    value = value.removeprefix("fc ").removeprefix("cf ").removeprefix("sc ").removeprefix("fk ")
     aliases = {"deportivo alaves": "alaves", "alaves": "alaves", "manchester city": "man city",
                "man city": "man city", "manchester united": "man united", "man united": "man united",
                "paris saint germain": "psg", "paris sg": "psg", "psg": "psg",
-               "fc barcelona": "barcelona", "barcelona": "barcelona", "real madrid": "real madrid"}
+               "fc barcelona": "barcelona", "barcelona": "barcelona", "real madrid": "real madrid",
+               "es troyes": "troyes", "troyes": "troyes", "bodo/glimt": "bodo/glimt"}
     value = aliases.get(value, value)
     return value
 
