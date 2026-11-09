@@ -17,7 +17,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FOOTBALL_API = "https://api.football-data.org/v4"
-COMPETITIONS = ("PD", "PL", "FL1", "BL1", "SA", "CL")
+TSD_API = "https://www.thesportsdb.com/api/v1/json/123"
+OLG_API = "https://api.openligadb.de"
+COMPETITIONS = ("PD", "PL", "FL1", "CL")
+TSD_LEAGUES = {"PD": "4335", "PL": "4328", "FL1": "4334", "CL": "4480"}
+OLG_LEAGUES = {"PD": "la1", "PL": "pl", "CL": "ucl"}
+COMP_NAMES_FR = {"PD": "La Liga", "PL": "Premier League", "FL1": "Ligue 1", "CL": "Ligue des champions UEFA"}
 
 
 def get_json(url: str, headers: dict[str, str] | None = None):
@@ -35,69 +40,267 @@ def atomic_json(name: str, payload: dict):
     tmp.replace(dest)
 
 
-def football(token: str, now: dt.datetime | None = None):
-    now = now or dt.datetime.now(dt.timezone.utc)
-    games: dict[int, dict] = {}
-    windows = ((-5, 4), (4, 7))
-    for index, (start, end) in enumerate(windows):
-        if index:
-            time.sleep(1.1)
-        query = urllib.parse.urlencode({
-            "competitions": ",".join(COMPETITIONS),
-            "dateFrom": (now.date() + dt.timedelta(days=start)).isoformat(),
-            "dateTo": (now.date() + dt.timedelta(days=end)).isoformat(),
-        })
-        page = get_json(f"{FOOTBALL_API}/matches?{query}", {"X-Auth-Token": token})
-        for row in page.get("matches") or []:
-            if row.get("id") is not None:
-                games[row["id"]] = row
+def iso_utc(value):
+    if not value:
+        return ""
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    except ValueError:
+        return ""
 
-    tables = {}
-    for index, code in enumerate(COMPETITIONS):
-        time.sleep(1.1)
-        data = get_json(f"{FOOTBALL_API}/competitions/{code}/standings", {"X-Auth-Token": token})
-        comp = data.get("competition") or {}
-        standings = (data.get("standings") or [{}])[0].get("table") or []
-        tables[code] = {
-            "code": code,
-            "name": comp.get("name", code),
-            "season": (data.get("season") or {}).get("startDate", "")[:4],
-            "table": [{
-                "position": item.get("position"),
-                "team": (item.get("team") or {}).get("name", ""),
-                "crest": (item.get("team") or {}).get("crest", ""),
-                "played": item.get("playedGames"), "won": item.get("won"),
-                "draw": item.get("draw"), "lost": item.get("lost"),
-                "points": item.get("points"), "goalDifference": item.get("goalDifference"),
-            } for item in standings],
-        }
 
-    matches = []
-    for item in games.values():
-        comp = item.get("competition") or {}
-        home, away = item.get("homeTeam") or {}, item.get("awayTeam") or {}
-        kickoff = item.get("utcDate")
-        if not (kickoff and home.get("name") and away.get("name")):
-            continue
-        score = (item.get("score") or {}).get("fullTime") or {}
-        status = item.get("status", "SCHEDULED")
-        status = {"FINISHED": "FT", "HALF_TIME": "PAUSED"}.get(status, status)
-        matches.append({
-            "idEvent": f"fd-{item['id']}", "source": "football-data.org",
-            "competitionCode": comp.get("code", ""), "strLeague": comp.get("name", ""),
-            "strSeason": str((item.get("season") or {}).get("startDate", ""))[:4],
-            "strHomeTeam": home["name"], "strAwayTeam": away["name"],
-            "strHomeTeamBadge": home.get("crest") or "", "strAwayTeamBadge": away.get("crest") or "",
-            "idHomeTeam": f"fd-team-{home.get('id', '')}", "idAwayTeam": f"fd-team-{away.get('id', '')}",
-            "strTimestamp": kickoff, "dateEvent": kickoff[:10], "strTime": kickoff[11:19],
-            "strStatus": status, "intHomeScore": score.get("home"), "intAwayScore": score.get("away"),
-            "intRound": item.get("matchday"), "strSport": "Soccer", "strProgress": "",
-        })
-    matches.sort(key=lambda x: (x["strTimestamp"], x["idEvent"]))
+def team_key(value):
+    import unicodedata
+    value = unicodedata.normalize("NFKD", str(value or "").casefold())
+    value = "".join(c for c in value if not unicodedata.combining(c))
+    value = " ".join(value.replace("&", " and ").replace(".", " ").split())
+    for suffix in (" football club", " fc", " cf", " sc", " club"):
+        if value.endswith(suffix):
+            value = value[:-len(suffix)].strip()
+    value = value.removeprefix("fc ").removeprefix("cf ").removeprefix("sc ")
+    aliases = {"deportivo alaves": "alaves", "alaves": "alaves", "manchester city": "man city",
+               "man city": "man city", "manchester united": "man united", "man united": "man united",
+               "paris saint germain": "psg", "paris sg": "psg", "psg": "psg",
+               "fc barcelona": "barcelona", "barcelona": "barcelona", "real madrid": "real madrid"}
+    value = aliases.get(value, value)
+    return value
+
+
+def event_key(event):
+    kickoff = str(event.get("strTimestamp") or "")[:10]
+    home, away = team_key(event.get("strHomeTeam")), team_key(event.get("strAwayTeam"))
+    if not kickoff or not home or not away:
+        return ""
+    return "|".join((str(event.get("competitionCode") or ""), kickoff, *sorted((home, away))))
+
+
+def tsd_event(raw, code):
+    home, away = raw.get("strHomeTeam"), raw.get("strAwayTeam")
+    stamp = iso_utc(raw.get("strTimestamp"))
+    if not stamp and raw.get("dateEvent"):
+        stamp = iso_utc(f"{raw['dateEvent']}T{raw.get('strTime') or '00:00:00'}Z")
+    if not stamp or not home or not away:
+        return None
     return {
-        "schema": 1, "source": "football-data.org", "scoresDelayed": True,
-        "updatedAt": now.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "idEvent": f"tsd-{raw.get('idEvent')}", "source": "TheSportsDB",
+        "feedKind": "public-aggregated",
+        "competitionCode": code, "strLeague": COMP_NAMES_FR[code],
+        "strSeason": raw.get("strSeason") or "", "strHomeTeam": home, "strAwayTeam": away,
+        "idHomeTeam": f"tsd-team-{raw.get('idHomeTeam') or ''}",
+        "idAwayTeam": f"tsd-team-{raw.get('idAwayTeam') or ''}",
+        "strTimestamp": stamp, "dateEvent": stamp[:10], "strTime": stamp[11:19],
+        "strStatus": raw.get("strStatus") or "SCHEDULED",
+        "intHomeScore": raw.get("intHomeScore"), "intAwayScore": raw.get("intAwayScore"),
+        "intRound": raw.get("intRound"), "strSport": "Soccer", "strProgress": "",
+        "sourceUpdatedAt": iso_utc(raw.get("dateModified")) or None,
+    }
+
+
+def tsd_standing(raw):
+    return {
+        "position": raw.get("intRank"), "team": raw.get("strTeam", ""),
+        "played": raw.get("intPlayed"), "won": raw.get("intWin"), "draw": raw.get("intDraw"),
+        "lost": raw.get("intLoss"), "points": raw.get("intPoints"),
+        "goalDifference": raw.get("intGoalDifference"),
+    }
+
+
+def fd_event(item):
+    comp = item.get("competition") or {}
+    home, away = item.get("homeTeam") or {}, item.get("awayTeam") or {}
+    kickoff = iso_utc(item.get("utcDate"))
+    if not (kickoff and home.get("name") and away.get("name")):
+        return None
+    score = (item.get("score") or {}).get("fullTime") or {}
+    status = {"FINISHED": "FT", "HALF_TIME": "PAUSED"}.get(item.get("status", "SCHEDULED"), item.get("status", "SCHEDULED"))
+    return {
+        "idEvent": f"fd-{item['id']}", "source": "football-data.org", "feedKind": "public-aggregated", "competitionCode": comp.get("code", ""),
+        "strLeague": COMP_NAMES_FR.get(comp.get("code"), comp.get("name", "")),
+        "strSeason": str((item.get("season") or {}).get("startDate", ""))[:4],
+        "strHomeTeam": home["name"], "strAwayTeam": away["name"],
+        "idHomeTeam": f"fd-team-{home.get('id', '')}", "idAwayTeam": f"fd-team-{away.get('id', '')}",
+        "strTimestamp": kickoff, "dateEvent": kickoff[:10], "strTime": kickoff[11:19],
+        "strStatus": status, "intHomeScore": score.get("home"), "intAwayScore": score.get("away"),
+        "intRound": item.get("matchday"), "strSport": "Soccer", "strProgress": "",
+        "sourceUpdatedAt": iso_utc(item.get("lastUpdated")) or None,
+    }
+
+
+def olg_event(raw, code):
+    home, away = raw.get("team1") or {}, raw.get("team2") or {}
+    kickoff = iso_utc(raw.get("matchDateTimeUTC") or raw.get("matchDateTime"))
+    if not (kickoff and home.get("teamName") and away.get("teamName")):
+        return None
+    results = raw.get("matchResults") or []
+    final = next((r for r in reversed(results) if r.get("pointsTeam1") is not None and r.get("pointsTeam2") is not None), {})
+    finished = bool(raw.get("matchIsFinished"))
+    return {
+        "idEvent": f"olg-{raw.get('matchID')}", "source": "OpenLigaDB", "feedKind": "public-aggregated", "competitionCode": code,
+        "strLeague": COMP_NAMES_FR[code], "strSeason": str(raw.get("leagueSeason") or ""),
+        "strHomeTeam": home["teamName"], "strAwayTeam": away["teamName"],
+        "idHomeTeam": f"olg-team-{home.get('teamId', '')}", "idAwayTeam": f"olg-team-{away.get('teamId', '')}",
+        "strTimestamp": kickoff, "dateEvent": kickoff[:10], "strTime": kickoff[11:19],
+        "strStatus": "FT" if finished else "SCHEDULED",
+        "intHomeScore": final.get("pointsTeam1") if finished else None,
+        "intAwayScore": final.get("pointsTeam2") if finished else None,
+        "intRound": raw.get("group", {}).get("groupOrderID"), "strSport": "Soccer", "strProgress": "",
+        "sourceUpdatedAt": iso_utc(raw.get("lastUpdateDateTime")) or None,
+    }
+
+
+def olg_table(raw):
+    return [{
+        "position": r.get("leaguePosition"), "team": r.get("teamName", ""),
+        "played": r.get("matches"), "won": r.get("won"), "draw": r.get("draw"), "lost": r.get("lost"),
+        "points": r.get("points"), "goalDifference": r.get("goalDifference"),
+    } for r in raw if r.get("teamName")]
+
+
+def football(token: str = "", now: dt.datetime | None = None):
+    """TheSportsDB's free records first; use full-cover sources only to fill its documented caps.
+
+    TheSportsDB's free league schedule endpoints return one event and its table endpoint five rows.
+    football-data.org is the full-coverage source for all four competitions. OpenLigaDB is a
+    no-key fallback for PD/PL/CL only. Data is cached/published as delayed, never as a live feed.
+    """
+    now = now or dt.datetime.now(dt.timezone.utc)
+    checked = now.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    tsd_events, tables, source_status = [], {}, {}
+    # 3 requests per league; 12 total, below TheSportsDB's 30/min free request limit.
+    for code, league_id in TSD_LEAGUES.items():
+        next_events, previous, table = [], [], []
+        for label, path in (("next", f"eventsnextleague.php?id={league_id}"),
+                            ("previous", f"eventspastleague.php?id={league_id}"),
+                            ("table", f"lookuptable.php?l={league_id}")):
+            try:
+                response = get_json(f"{TSD_API}/{path}")
+                if label == "next": next_events = response.get("events") or []
+                elif label == "previous": previous = response.get("results") or []
+                else: table = response.get("table") or []
+            except Exception:
+                pass
+        tsd_events.extend(e for r in next_events + previous if (e := tsd_event(r, code)))
+        if table:
+            tables[code] = {
+                "code": code, "name": COMP_NAMES_FR[code], "season": table[0].get("strSeason", ""),
+                "source": "TheSportsDB", "complete": False,
+                "table": [tsd_standing(row) for row in table],
+            }
+        source_status[code] = {"thesportsdb": {"next": len(next_events), "previous": len(previous), "tableRows": len(table)}}
+
+    # Full fixtures and standings, within football-data.org's 10 calls/min free limit.
+    fd_events, fd_comp_available, fd_table_available = [], set(), set()
+    failures = []
+    if token:
+        try:
+            for index, (start, end) in enumerate(((-5, 4), (4, 7))):
+                if index: time.sleep(1.1)
+                query = urllib.parse.urlencode({
+                    "competitions": ",".join(COMPETITIONS),
+                    "dateFrom": (now.date() + dt.timedelta(days=start)).isoformat(),
+                    "dateTo": (now.date() + dt.timedelta(days=end)).isoformat(),
+                })
+                page = get_json(f"{FOOTBALL_API}/matches?{query}", {"X-Auth-Token": token})
+                for raw in page.get("matches") or []:
+                    event = fd_event(raw)
+                    if event: fd_events.append(event)
+            fd_comp_available.update(COMPETITIONS)
+        except Exception as exc:
+            failures.append(f"football-data.org matches: {type(exc).__name__}")
+        for index, code in enumerate(COMPETITIONS):
+            try:
+                time.sleep(1.1)
+                data = get_json(f"{FOOTBALL_API}/competitions/{code}/standings", {"X-Auth-Token": token})
+                comp = data.get("competition") or {}
+                rows = (data.get("standings") or [{}])[0].get("table") or []
+                if rows:
+                    tables[code] = {
+                        "code": code, "name": COMP_NAMES_FR[code],
+                        "season": str((data.get("season") or {}).get("startDate", ""))[:4],
+                        "source": "football-data.org", "complete": True,
+                        "table": [{
+                            "position": row.get("position"), "team": (row.get("team") or {}).get("name", ""),
+                            "played": row.get("playedGames"), "won": row.get("won"), "draw": row.get("draw"),
+                            "lost": row.get("lost"), "points": row.get("points"),
+                            "goalDifference": row.get("goalDifference"),
+                        } for row in rows],
+                    }
+                    fd_table_available.add(code)
+            except Exception as exc:
+                failures.append(f"football-data.org {code}: {type(exc).__name__}")
+    else:
+        failures.append("football-data.org skipped: token not configured")
+
+    # OpenLigaDB is a fallback only when football-data.org lacks a competition response.
+    # Its actual 2026 season catalogue has PD, PL and CL, but no Ligue 1.
+    olg_events, olg_match_available = [], set()
+    for code, shortcut in OLG_LEAGUES.items():
+        if code in fd_comp_available and code in fd_table_available:
+            continue
+        try:
+            season = now.year if now.month >= 7 else now.year - 1
+            if code not in fd_comp_available:
+                raw_matches = get_json(f"{OLG_API}/getmatchdata/{shortcut}/{season}")
+                olg_match_available.add(code)
+                for raw in raw_matches:
+                    event = olg_event(raw, code)
+                    if event:
+                        kickoff = dt.datetime.fromisoformat(event["strTimestamp"].replace("Z", "+00:00"))
+                        if now - dt.timedelta(days=5) <= kickoff <= now + dt.timedelta(days=7):
+                            olg_events.append(event)
+            if code not in fd_table_available and (code not in tables or not tables[code].get("complete")):
+                rows = olg_table(get_json(f"{OLG_API}/getbltable/{shortcut}/{season}"))
+                if rows and (code not in tables or len(rows) > len(tables[code].get("table", []))):
+                    tables[code] = {"code": code, "name": COMP_NAMES_FR[code], "season": str(season),
+                                    "source": "OpenLigaDB", "complete": True, "table": rows}
+            source_status[code]["openligadb"] = "utilisé si football-data.org indisponible"
+        except Exception as exc:
+            source_status[code]["openligadbError"] = type(exc).__name__
+
+    # Keep TheSportsDB's records first for matching events; use full-coverage feeds to fill its free-tier gaps.
+    matches_by_key = {}
+    for event in tsd_events + fd_events + olg_events:
+        key = event_key(event)
+        if not key:
+            continue
+        old = matches_by_key.get(key)
+        if old is None:
+            matches_by_key[key] = event
+        else:
+            # Keep complete source timing/status/scores and merge non-empty metadata, never duplicate the fixture.
+            primary = old if old.get("source") == "TheSportsDB" else event if event.get("source") == "TheSportsDB" else old
+            other = event if primary is old else old
+            merged = dict(other); merged.update({k: v for k, v in primary.items() if v not in (None, "")})
+            # football-data's delayed result/status is the authoritative value when available.
+            fd = next((x for x in (old, event) if x.get("source") == "football-data.org"), None)
+            if fd:
+                for k in ("strTimestamp", "dateEvent", "strTime", "strStatus", "intHomeScore", "intAwayScore"):
+                    if k in fd: merged[k] = fd[k]
+            merged["source"] = "+".join(dict.fromkeys((old.get("source", ""), event.get("source", ""))))
+            merged["feedKind"] = "public-aggregated"
+            matches_by_key[key] = merged
+    for code in COMPETITIONS:
+        source_status.setdefault(code, {})
+        match_coverage = "complete" if code in fd_comp_available or code in olg_match_available else "partial"
+        table_coverage = "complete" if tables.get(code, {}).get("complete") else "partial" if code in tables else "unavailable"
+        source_status[code]["matchCoverage"] = match_coverage
+        source_status[code]["tableCoverage"] = table_coverage
+        source_status[code]["coverage"] = "complete" if match_coverage == table_coverage == "complete" else "partial"
+    matches = sorted(matches_by_key.values(), key=lambda x: (x["strTimestamp"], x["competitionCode"], x["idEvent"]))
+    source_data_times = [e.get("sourceUpdatedAt") for e in matches if e.get("sourceUpdatedAt")]
+    return {
+        "schema": 1, "source": "multi-source", "scoresDelayed": True,
+        "updatedAt": checked, "checkedAt": checked,
+        "sourceDataUpdatedAt": max(source_data_times) if source_data_times else None,
         "timezone": "Europe/Paris", "competitions": list(COMPETITIONS),
+        "sources": ["TheSportsDB", "football-data.org", "OpenLigaDB"],
+        "attribution": {"TheSportsDB": "Sports data: TheSportsDB",
+                        "football-data.org": "Football data provided by the Football-Data.org API",
+                        "OpenLigaDB": "Daten von OpenLigaDB (ODbL 1.0)"},
+        "sourceStatus": source_status, "providerFailures": failures,
         "matches": matches, "standings": tables,
     }
 
@@ -155,7 +358,11 @@ def main():
     token = os.environ.get("FOOTBALL_DATA_TOKEN", "").strip()
     now = dt.datetime.now(dt.timezone.utc)
     # Build and validate all feeds in memory before replacing any existing file.
-    finance_payload = finance()
+    try:
+        finance_payload = finance()
+    except Exception as exc:
+        finance_payload = None
+        print(f"Finance feed retained its last valid file ({type(exc).__name__}).")
     holiday_payload = {
         "schema": 1, "source": "French public holiday calendar",
         "timezone": "Europe/Paris", "years": {
@@ -163,17 +370,21 @@ def main():
         },
         "note": "National holidays only; Alsace-Moselle local holidays are not included.",
     }
-    if token:
-        match_payload = football(token, now)
-        atomic_json("football.json", match_payload)
-        match_report = f"{len(match_payload['matches'])} matches, {len(match_payload['standings'])} tables"
-    else:
-        # Keep the last known football file intact until the user adds the free API token.
-        match_report = "football skipped (FOOTBALL_DATA_TOKEN is not configured)"
-    atomic_json("finance.json", finance_payload)
+    match_payload = football(token, now)
+    if not match_payload["matches"]:
+        # Do not replace a valid matches feed with an empty upstream response, even if tables answered.
+        raise RuntimeError("All football sources returned no usable matches; keeping the previous football.json")
+    atomic_json("football.json", match_payload)
+    partial = [code for code, status in match_payload["sourceStatus"].items() if status.get("coverage") != "complete"]
+    match_report = (f"{len(match_payload['matches'])} deduplicated matches, "
+                    f"{len(match_payload['standings'])} tables, checked {match_payload['checkedAt']}, "
+                    f"partial coverage: {','.join(partial) if partial else 'none'}")
+    if finance_payload:
+        atomic_json("finance.json", finance_payload)
     atomic_json("fr-holidays.json", holiday_payload)
     print(f"Validated feeds: {match_report}; "
-          f"FX date {finance_payload['fxDate']}; gold EUR/g; {sum(map(len, holiday_payload['years'].values()))} holidays.")
+          f"FX date {finance_payload['fxDate'] if finance_payload else 'unchanged'}; "
+          f"gold EUR/g; {sum(map(len, holiday_payload['years'].values()))} holidays.")
 
 
 if __name__ == "__main__":

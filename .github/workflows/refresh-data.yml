@@ -2,20 +2,25 @@ name: Refresh public data feeds
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/refresh-data.yml
+      - scripts/refresh_data.py
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '17,47 * * * *'
 
 permissions:
   contents: write
 
 concurrency:
-  group: refresh-public-feeds
+  group: public-data-main-publish
   cancel-in-progress: false
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,16 +28,59 @@ jobs:
           python-version: '3.x'
       - name: Refresh football, finance, and French holiday JSON
         env:
-          FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
+          FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN || secrets.FOOTBALL_DATA }}
         run: python scripts/refresh_data.py
-      - name: Publish changed JSON files with the repository token
+      - name: Publish changed JSON files without overwriting newer main data
+        env:
+          SNAPSHOT_DIR: ${{ runner.temp }}/feed-snapshots
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add football.json finance.json fr-holidays.json
-          if git diff --cached --quiet; then
-            echo "No feed changes to publish."
-            exit 0
-          fi
-          git commit -m "Refresh public data feeds"
-          git push origin HEAD:main
+          mkdir -p "$SNAPSHOT_DIR"
+          cp football.json finance.json fr-holidays.json "$SNAPSHOT_DIR/"
+
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            # This runner is disposable. Restore the newest remote tree, then apply only our
+            # newly generated feeds if their timestamps are newer; never rewrite remote history.
+            git reset --hard origin/main
+            python - "$SNAPSHOT_DIR" <<'PY'
+          import json, pathlib, shutil, sys
+          snapshot = pathlib.Path(sys.argv[1])
+          for name in ("football.json", "finance.json", "fr-holidays.json"):
+              candidate = snapshot / name
+              if not candidate.exists():
+                  continue
+              try:
+                  generated = json.loads(candidate.read_text(encoding="utf-8"))
+                  target = pathlib.Path(name)
+                  current = json.loads(target.read_text(encoding="utf-8")) if target.exists() else None
+                  generated_at = generated.get("checkedAt") or generated.get("updatedAt")
+                  current_at = (current or {}).get("checkedAt") or (current or {}).get("updatedAt")
+                  if current is not None:
+                      if generated_at and current_at and current_at >= generated_at:
+                          print(f"Keeping newer {name} from main")
+                          continue
+                      if not generated_at and current.get("years") == generated.get("years"):
+                          print(f"Keeping unchanged {name} from main")
+                          continue
+                  shutil.copyfile(candidate, target)
+              except (OSError, ValueError) as exc:
+                  raise SystemExit(f"Cannot validate {name}: {type(exc).__name__}")
+          PY
+            git add football.json finance.json fr-holidays.json
+            if git diff --cached --quiet; then
+              echo "No newer feed data to publish."
+              exit 0
+            fi
+            git commit -m "Refresh public data feeds"
+            if git push origin HEAD:main; then
+              echo "Published feeds on main."
+              exit 0
+            fi
+            echo "main advanced during publication; retrying from the latest main (attempt $attempt/5)."
+            sleep $((attempt * 2))
+          done
+          echo "::error::Could not publish after 5 normal push attempts. No force push was used."
+          exit 1
