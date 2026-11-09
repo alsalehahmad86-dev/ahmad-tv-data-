@@ -8,11 +8,14 @@ All files are written atomically only after their upstream response validates.
 from __future__ import annotations
 
 import datetime as dt
+import html
 import json
 import os
+import re
 import time
 import urllib.parse
 import urllib.request
+from html.parser import HTMLParser
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,7 +25,35 @@ OLG_API = "https://api.openligadb.de"
 COMPETITIONS = ("PD", "PL", "FL1", "CL")
 TSD_LEAGUES = {"PD": "4335", "PL": "4328", "FL1": "4334", "CL": "4480"}
 OLG_LEAGUES = {"PD": "la1", "PL": "pl", "CL": "ucl"}
-COMP_NAMES_FR = {"PD": "La Liga", "PL": "Premier League", "FL1": "Ligue 1", "CL": "Ligue des champions UEFA"}
+TSD_NATIONAL_LEAGUES = {"UNL": "4490"}
+COMP_NAMES_FR = {"PD": "La Liga", "PL": "Premier League", "FL1": "Ligue 1", "CL": "Ligue des champions UEFA",
+                 "UNL": "Ligue des nations UEFA", "AFCONQ": "Qualifications AFCON PAMOJA 2027"}
+CAF_FIXTURES_URL = "https://www.cafonline.com/afcon2025/news/crucial-matchdays-3-and-4-to-shape-totalenergies-caf-afcon-pamoja-2027-qualification-race/"
+# CAF publishes the confirmed AFCON 2027 qualifier schedule as a fixture list, not a public JSON API.
+# Keep only fixtures confirmed in its 3 November 2026 article, and verify the official page before emitting them.
+CAF_2027_MD3 = (
+    ("2026-11-12", "15:00", "Ghana", "Somalia", "Ghana", "Somalia"),
+    ("2026-11-12", "19:00", "Côte d’Ivoire", "Gambie", "Côte d’Ivoire", "Gambia"),
+    ("2026-11-12", "16:00", "Guinée", "Érythrée", "Guinea", "Eritrea"),
+    ("2026-11-12", "16:00", "RD Congo", "Sierra Leone", "DR Congo", "Sierra Leone"),
+    ("2026-11-12", "16:00", "Guinée équatoriale", "Zimbabwe", "Equatorial Guinea", "Zimbabwe"),
+    ("2026-11-12", "19:00", "Bénin", "République centrafricaine", "Benin", "Central African Republic"),
+    ("2026-11-12", "19:00", "Cameroun", "Namibie", "Cameroon", "Namibia"),
+    ("2026-11-12", "19:00", "Sénégal", "Soudan", "Senegal", "Sudan"),
+    ("2026-11-12", "16:00", "Madagascar", "Guinée-Bissau", "Madagascar", "Guinea-Bissau"),
+    ("2026-11-13", "16:00", "Gabon", "Lesotho", "Gabon", "Lesotho"),
+    ("2026-11-13", "20:00", "Maroc", "Niger", "Morocco", "Niger"),
+    ("2026-11-13", "19:00", "Égypte", "Malawi", "Egypt", "Malawi"),
+    ("2026-11-13", "16:00", "Afrique du Sud", "Kenya", "South Africa", "Kenya"),
+    ("2026-11-13", "16:00", "Burkina Faso", "Mauritanie", "Burkina Faso", "Mauritania"),
+    ("2026-11-13", "13:00", "Comores", "Congo", "Comoros", "Congo"),
+    ("2026-11-13", "16:00", "Tunisie", "Libye", "Tunisia", "Libya"),
+    ("2026-11-13", "13:00", "Zambie", "Burundi", "Zambia", "Burundi"),
+    ("2026-11-13", "13:00", "Mozambique", "Éthiopie", "Mozambique", "Ethiopia"),
+    ("2026-11-13", "16:00", "Cap-Vert", "Libéria", "Cape Verde", "Liberia"),
+    ("2026-11-13", "19:00", "Mali", "Rwanda", "Mali", "Rwanda"),
+    ("2026-11-13", "16:00", "Nigeria", "Tanzanie", "Nigeria", "Tanzania"),
+)
 # dateTo is exclusive in football-data.org. These disjoint windows include
 # seven days of recent results, today, and every date through day +30.
 MATCH_WINDOWS = ((-7, 3), (3, 13), (13, 23), (23, 31))
@@ -34,6 +65,91 @@ def get_json(url: str, headers: dict[str, str] | None = None):
         if response.status != 200:
             raise RuntimeError(f"Upstream returned HTTP {response.status}: {urllib.parse.urlsplit(url).hostname}")
         return json.loads(response.read().decode("utf-8"))
+
+
+class _VisibleText(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.hidden = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "noscript"):
+            self.hidden += 1
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "noscript") and self.hidden:
+            self.hidden -= 1
+
+    def handle_data(self, data):
+        if not self.hidden and data.strip():
+            self.parts.append(data.strip())
+
+
+def get_page_text(url: str):
+    req = urllib.request.Request(url, headers={"User-Agent": "ahmad-tv-data-feed/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        if response.status != 200:
+            raise RuntimeError(f"Fixture page returned HTTP {response.status}: {urllib.parse.urlsplit(url).hostname}")
+        parser = _VisibleText()
+        parser.feed(response.read().decode("utf-8", "replace"))
+        return " ".join(parser.parts)
+
+
+def caf_afcon_2027_events(now: dt.datetime):
+    """Use only CAF's confirmed MD3 fixture announcement; emit nothing if it can't be verified."""
+    text = re.sub(r"\s+", " ", html.unescape(get_page_text(CAF_FIXTURES_URL))).casefold()
+    if "matchday 3 fixtures" not in text or "all times in gmt" not in text:
+        raise RuntimeError("CAF official MD3 fixture list not present")
+    # Confirm the article still contains every listed country and date/time before accepting the curated records.
+    for day, kickoff, _home_fr, _away_fr, home_src, away_src in CAF_2027_MD3:
+        if home_src.casefold() not in text or away_src.casefold() not in text:
+            raise RuntimeError("CAF official fixture names could not be verified")
+        time_label = f"{int(day[8:10])}/11, {int(kickoff[:2])}h{kickoff[3:]}"
+        if time_label.casefold() not in text:
+            raise RuntimeError("CAF official fixture date/time could not be verified")
+    checked = now.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    rows = []
+    for day, kickoff, home, away, _home_src, _away_src in CAF_2027_MD3:
+        stamp = f"{day}T{kickoff}:00Z"
+        start = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if not now - dt.timedelta(minutes=1) <= start <= now + dt.timedelta(days=31):
+            continue
+        rows.append({
+            "idEvent": f"caf-afconq-2027-{day.replace('-', '')}-{team_key(home)}-{team_key(away)}",
+            "source": "CAF official fixtures", "sourceUrl": CAF_FIXTURES_URL,
+            "feedKind": "public-aggregated", "competitionCode": "AFCONQ",
+            "strLeague": COMP_NAMES_FR["AFCONQ"], "strCompetitionBadge": "",
+            "strSeason": "2027", "strHomeTeam": home, "strAwayTeam": away,
+            "strTimestamp": stamp, "dateEvent": day, "strTime": kickoff + ":00",
+            "strStatus": "TIMED", "intHomeScore": None, "intAwayScore": None,
+            "intRound": 3, "strSport": "Soccer", "strProgress": "",
+            "sourceCheckedAt": checked,
+        })
+    return rows
+
+
+def thesportsdb_nations_league_events(now: dt.datetime):
+    """Get the next UEFA Nations League rounds from TheSportsDB's free V1 schedule feed."""
+    events, status = [], {"leagueId": "4490"}
+    for code, league_id in TSD_NATIONAL_LEAGUES.items():
+        try:
+            upcoming = get_json(f"{TSD_API}/eventsnextleague.php?id={league_id}").get("events") or []
+            rounds = sorted({int(event.get("intRound")) for event in upcoming if str(event.get("intRound", "")).isdigit()})
+            if not rounds:
+                raise RuntimeError("TheSportsDB did not provide the next league round")
+            found = []
+            for round_number in (rounds[0], rounds[0] + 1):
+                result = get_json(f"{TSD_API}/eventsround.php?id={league_id}&r={round_number}")
+                found.extend(e for raw in result.get("events") or [] if (e := tsd_event(raw, code)))
+                time.sleep(0.25)
+            start = now - dt.timedelta(days=7)
+            end = now + dt.timedelta(days=31)
+            events.extend(e for e in found if start <= dt.datetime.fromisoformat(e["strTimestamp"].replace("Z", "+00:00")) <= end)
+            status[code] = {"roundsChecked": [rounds[0], rounds[0] + 1], "matches": len(events)}
+        except Exception as exc:
+            status[code] = {"error": type(exc).__name__}
+    return events, status
 
 
 def atomic_json(name: str, payload: dict):
@@ -97,6 +213,8 @@ def tsd_event(raw, code):
         "strSeason": raw.get("strSeason") or "", "strHomeTeam": home, "strAwayTeam": away,
         "idHomeTeam": f"tsd-team-{raw.get('idHomeTeam') or ''}",
         "idAwayTeam": f"tsd-team-{raw.get('idAwayTeam') or ''}",
+        "strHomeTeamBadge": raw.get("strHomeTeamBadge") or "",
+        "strAwayTeamBadge": raw.get("strAwayTeamBadge") or "",
         "strTimestamp": stamp, "dateEvent": stamp[:10], "strTime": stamp[11:19],
         "strStatus": raw.get("strStatus") or "SCHEDULED",
         "intHomeScore": raw.get("intHomeScore"), "intAwayScore": raw.get("intAwayScore"),
@@ -170,16 +288,17 @@ def olg_table(raw):
 
 
 def football(token: str = "", now: dt.datetime | None = None):
-    """TheSportsDB's free records first; use full-cover sources only to fill its documented caps.
+    """Use the free public schedules first, with the full-cover club feeds as gap fillers.
 
-    TheSportsDB's free league schedule endpoints return one event and its table endpoint five rows.
-    football-data.org is the full-coverage source for all four competitions. OpenLigaDB is a
-    no-key fallback for PD/PL/CL only. Data is cached/published as delayed, never as a live feed.
+    TheSportsDB's free league next/previous endpoints return one event and its table endpoint five rows.
+    football-data.org is the full-coverage source for the four supported club competitions. OpenLigaDB
+    is a no-key fallback for PD/PL/CL only. National fixtures are limited to the next UEFA Nations
+    League rounds and CAF's verified public schedule. Scores are delayed, never represented as live.
     """
     now = now or dt.datetime.now(dt.timezone.utc)
     checked = now.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-    tsd_events, tables, source_status = [], {}, {}
-    # 3 requests per league; 12 total, below TheSportsDB's 30/min free request limit.
+    tsd_events, tables, source_status, failures = [], {}, {}, []
+    # Three free schedule/table lookups per club league.
     for code, league_id in TSD_LEAGUES.items():
         next_events, previous, table = [], [], []
         for label, path in (("next", f"eventsnextleague.php?id={league_id}"),
@@ -201,10 +320,27 @@ def football(token: str = "", now: dt.datetime | None = None):
             }
         source_status[code] = {"thesportsdb": {"next": len(next_events), "previous": len(previous), "tableRows": len(table)}}
 
+    # Club fixtures above come from the four supported club leagues. The free
+    # football-data.org tier has no national-team competitions, so fill the
+    # current national-team schedule from TheSportsDB and CAF's official list.
+    national_events, national_status = thesportsdb_nations_league_events(now)
+    tsd_events.extend(national_events)
+    source_status["UNL"] = {"thesportsdb": national_status.get("UNL", {}),
+                            "matchCoverage": "round schedules" if national_status.get("UNL", {}).get("matches") else "unavailable"}
+    try:
+        caf_events = caf_afcon_2027_events(now)
+        source_status["AFCONQ"] = {"cafOfficialFixtures": {"matches": len(caf_events), "url": CAF_FIXTURES_URL},
+                                  "matchCoverage": "confirmed fixtures"}
+    except Exception as exc:
+        caf_events = []
+        failures.append(f"CAF official AFCON fixtures: {type(exc).__name__}")
+        source_status["AFCONQ"] = {"cafOfficialFixtures": {"error": type(exc).__name__},
+                                  "matchCoverage": "unavailable"}
+    tsd_events.extend(caf_events)
+
     # Four fixture windows plus four tables use eight calls, under the free
     # tier's ten calls/minute limit. dateTo is exclusive.
     fd_events, fd_comp_available, fd_table_available = [], set(), set()
-    failures = []
     if token:
         try:
             for index, (start, end) in enumerate(MATCH_WINDOWS):
@@ -308,14 +444,15 @@ def football(token: str = "", now: dt.datetime | None = None):
         "schema": 1, "source": "multi-source", "scoresDelayed": True,
         "updatedAt": checked, "checkedAt": checked,
         "sourceDataUpdatedAt": max(source_data_times) if source_data_times else None,
-        "timezone": "Europe/Paris", "competitions": list(COMPETITIONS),
+        "timezone": "Europe/Paris", "competitions": [*COMPETITIONS, "UNL", "AFCONQ"],
         "fixtureRange": {"from": (now.date() - dt.timedelta(days=7)).isoformat(),
                          "through": (now.date() + dt.timedelta(days=31)).isoformat()},
         "competitionBadges": competition_badges,
-        "sources": ["TheSportsDB", "football-data.org", "OpenLigaDB"],
+        "sources": ["TheSportsDB", "football-data.org", "OpenLigaDB", "CAF official fixtures"],
         "attribution": {"TheSportsDB": "Sports data: TheSportsDB",
                         "football-data.org": "Football data provided by the Football-Data.org API",
-                        "OpenLigaDB": "Daten von OpenLigaDB (ODbL 1.0)"},
+                        "OpenLigaDB": "Daten von OpenLigaDB (ODbL 1.0)",
+                        "CAF official fixtures": CAF_FIXTURES_URL},
         "sourceStatus": source_status, "providerFailures": failures,
         "matches": matches, "standings": tables,
     }
