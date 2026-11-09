@@ -130,7 +130,7 @@ def caf_afcon_2027_events(now: dt.datetime):
 
 
 def thesportsdb_nations_league_events(now: dt.datetime):
-    """Get the next UEFA Nations League rounds from TheSportsDB's free V1 schedule feed."""
+    """Get the next UEFA Nations League round from TheSportsDB's free V1 schedule feed."""
     events, status = [], {"leagueId": "4490"}
     for code, league_id in TSD_NATIONAL_LEAGUES.items():
         try:
@@ -138,17 +138,14 @@ def thesportsdb_nations_league_events(now: dt.datetime):
             rounds = sorted({int(event.get("intRound")) for event in upcoming if str(event.get("intRound", "")).isdigit()})
             if not rounds:
                 raise RuntimeError("TheSportsDB did not provide the next league round")
-            found = []
-            for round_number in (rounds[0], rounds[0] + 1):
-                result = get_json(f"{TSD_API}/eventsround.php?id={league_id}&r={round_number}")
-                found.extend(e for raw in result.get("events") or [] if (e := tsd_event(raw, code)))
-                time.sleep(0.25)
+            result = get_json(f"{TSD_API}/eventsround.php?id={league_id}&r={rounds[0]}")
+            found = [e for raw in result.get("events") or [] if (e := tsd_event(raw, code))]
             start = now - dt.timedelta(days=7)
             end = now + dt.timedelta(days=31)
             events.extend(e for e in found if start <= dt.datetime.fromisoformat(e["strTimestamp"].replace("Z", "+00:00")) <= end)
-            status[code] = {"roundsChecked": [rounds[0], rounds[0] + 1], "matches": len(events)}
+            status[code] = {"roundChecked": rounds[0], "matches": len(found)}
         except Exception as exc:
-            status[code] = {"error": type(exc).__name__}
+            status[code] = {"error": f"HTTP {exc.code}" if isinstance(exc, urllib.error.HTTPError) else type(exc).__name__}
     return events, status
 
 
@@ -290,35 +287,33 @@ def olg_table(raw):
 def football(token: str = "", now: dt.datetime | None = None):
     """Use the free public schedules first, with the full-cover club feeds as gap fillers.
 
-    TheSportsDB's free league next/previous endpoints return one event and its table endpoint five rows.
+    TheSportsDB's free league next endpoint returns one event and its table endpoint five rows.
     football-data.org is the full-coverage source for the four supported club competitions. OpenLigaDB
-    is a no-key fallback for PD/PL/CL only. National fixtures are limited to the next UEFA Nations
+    is a no-key fallback for PD/PL/CL only. National fixtures use the next UEFA Nations League
     League rounds and CAF's verified public schedule. Scores are delayed, never represented as live.
     """
     now = now or dt.datetime.now(dt.timezone.utc)
     checked = now.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     tsd_events, tables, source_status, failures = [], {}, {}, []
-    # Three free schedule/table lookups per club league.
+    # Two schedule/table lookups per club league, reserving two calls for the next national-team round.
     for code, league_id in TSD_LEAGUES.items():
-        next_events, previous, table = [], [], []
+        next_events, table = [], []
         for label, path in (("next", f"eventsnextleague.php?id={league_id}"),
-                            ("previous", f"eventspastleague.php?id={league_id}"),
                             ("table", f"lookuptable.php?l={league_id}")):
             try:
                 response = get_json(f"{TSD_API}/{path}")
                 if label == "next": next_events = response.get("events") or []
-                elif label == "previous": previous = response.get("results") or []
                 else: table = response.get("table") or []
             except Exception:
                 pass
-        tsd_events.extend(e for r in next_events + previous if (e := tsd_event(r, code)))
+        tsd_events.extend(e for r in next_events if (e := tsd_event(r, code)))
         if table:
             tables[code] = {
                 "code": code, "name": COMP_NAMES_FR[code], "season": table[0].get("strSeason", ""),
                 "source": "TheSportsDB", "complete": False,
                 "table": [tsd_standing(row) for row in table],
             }
-        source_status[code] = {"thesportsdb": {"next": len(next_events), "previous": len(previous), "tableRows": len(table)}}
+        source_status[code] = {"thesportsdb": {"next": len(next_events), "tableRows": len(table)}}
 
     # Club fixtures above come from the four supported club leagues. The free
     # football-data.org tier has no national-team competitions, so fill the
