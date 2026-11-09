@@ -143,6 +143,10 @@ def french_holidays(year: int):
     rows = [{"date": dt.date(year, month, day).isoformat(), "name": name, "scope": "France"}
             for month, day, name in fixed]
     rows.extend({"date": day.isoformat(), "name": name, "scope": "France"} for day, name in movable)
+    rows.extend([
+        {"date": (easter - dt.timedelta(days=2)).isoformat(), "name": "Vendredi saint", "scope": "Alsace-Moselle"},
+        {"date": dt.date(year, 12, 26).isoformat(), "name": "Saint-Étienne", "scope": "Alsace-Moselle"},
+    ])
     rows.sort(key=lambda x: x["date"])
     return rows
 
@@ -153,8 +157,7 @@ def main():
     # Build and validate all feeds in memory before replacing any existing file.
     finance_payload = finance()
     holiday_payload = {
-        "schema": 1, "source": "French national public holiday calendar",
-        "updatedAt": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "schema": 1, "source": "French public holiday calendar",
         "timezone": "Europe/Paris", "years": {
             str(year): french_holidays(year) for year in (now.year, now.year + 1)
         },
