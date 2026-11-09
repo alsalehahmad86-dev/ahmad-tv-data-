@@ -152,11 +152,14 @@ def olg_event(raw, code):
 
 
 def olg_table(raw):
+    # OpenLigaDB's getbltable response is already ordered by rank, but does not
+    # provide leaguePosition and calls the goal-difference field goalDiff.
+    # Derive the ordinal from that provider order and preserve its real value.
     return [{
-        "position": r.get("leaguePosition"), "team": r.get("teamName", ""),
+        "position": r.get("leaguePosition") or position, "team": r.get("teamName", ""),
         "played": r.get("matches"), "won": r.get("won"), "draw": r.get("draw"), "lost": r.get("lost"),
-        "points": r.get("points"), "goalDifference": r.get("goalDifference"),
-    } for r in raw if r.get("teamName")]
+        "points": r.get("points"), "goalDifference": r.get("goalDifference", r.get("goalDiff")),
+    } for position, r in enumerate((row for row in raw if row.get("teamName")), start=1)]
 
 
 def football(token: str = "", now: dt.datetime | None = None):
