@@ -184,6 +184,7 @@ def team_key(value):
                "fc barcelona": "barcelona", "barcelona": "barcelona", "real madrid": "real madrid",
                "athletic": "athletic bilbao", "athletic club": "athletic bilbao",
                "athletic club de bilbao": "athletic bilbao", "athletic bilbao": "athletic bilbao",
+               "rcd espanyol de barcelona": "espanyol", "rcd espanyol": "espanyol", "espanyol": "espanyol",
                "es troyes": "troyes", "troyes": "troyes", "bodo/glimt": "bodo/glimt"}
     value = aliases.get(value, value)
     return value
