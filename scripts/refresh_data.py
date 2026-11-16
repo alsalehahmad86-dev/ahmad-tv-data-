@@ -182,9 +182,18 @@ def team_key(value):
                "man city": "man city", "manchester united": "man united", "man united": "man united",
                "paris saint germain": "psg", "paris sg": "psg", "psg": "psg",
                "fc barcelona": "barcelona", "barcelona": "barcelona", "real madrid": "real madrid",
+               "athletic": "athletic bilbao", "athletic club": "athletic bilbao",
+               "athletic club de bilbao": "athletic bilbao", "athletic bilbao": "athletic bilbao",
                "es troyes": "troyes", "troyes": "troyes", "bodo/glimt": "bodo/glimt"}
     value = aliases.get(value, value)
     return value
+
+
+def is_israel_team(value):
+    """Hide Israel's national sides and Israeli club teams from match cards."""
+    name = team_key(value)
+    return name == "israel" or name.startswith(("israel ", "maccabi ", "hapoel ", "beitar ",
+                                                "bnei sakhnin ", "ashdod ", "ironi "))
 
 
 def event_key(event):
@@ -405,6 +414,8 @@ def football(token: str = "", now: dt.datetime | None = None):
     # Keep TheSportsDB's records first for matching events; use full-coverage feeds to fill its free-tier gaps.
     matches_by_key = {}
     for event in tsd_events + fd_events + olg_events:
+        if is_israel_team(event.get("strHomeTeam")) or is_israel_team(event.get("strAwayTeam")):
+            continue
         key = event_key(event)
         if not key:
             continue
